@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gradient-to-br from-white via-blue-50 to-blue-100 text-slate-800 min-h-screen;
+}
+
+.input {
+  @apply w-full rounded-lg border border-blue-100 bg-white px-3 py-2 outline-none transition focus:ring-2 focus:ring-medBlue/40;
+}
+
+.glass-card {
+  @apply bg-white/65 backdrop-blur rounded-2xl shadow-glass border border-white/40;
+}
+
+.hover-lift {
+  @apply transition duration-300 hover:-translate-y-1 hover:shadow-xl;
+}
+
+.fade-in {
+  animation: fade-in 450ms ease-out;
+}
+
+.pulse-soft {
+  animation: pulse-soft 1.4s ease-in-out infinite;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
