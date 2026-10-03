@@ -133,7 +133,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="/kaggle/input/chest-xray-pneumonia")
-    parser.add_argument("--output", default="cnn_model/medxai_model.h5")
+    parser.add_argument("--output", default="cnn_model/medxai_model.keras")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--fine-tune-epochs", type=int, default=15)
     parser.add_argument("--unfreeze-layers", type=int, default=80)

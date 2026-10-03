@@ -34,7 +34,8 @@ for directory in [UPLOAD_DIR, HEATMAP_DIR, REPORT_DIR]:
 app = Flask(__name__)
 CORS(app)
 
-XRAY_CLASSES = ["Normal", "Pneumonia", "Tuberculosis", "COVID-19"]
+# medxai_model.keras has a single sigmoid output: 0 = Normal, 1 = Pneumonia.
+XRAY_CLASSES = ["Normal", "Pneumonia"]
 EYE_CLASSES = ["Healthy", "Conjunctivitis", "Cataract", "Diabetic Retinopathy"]
 
 
@@ -84,22 +85,28 @@ def _safe_load_model(model_path: Path) -> tf.keras.Model | None:
         app.logger.warning("Model file missing: %s", model_path)
         return None
     try:
-        return tf.keras.models.load_model(model_path)
+        return tf.keras.models.load_model(model_path, compile=False)
     except Exception as exc:  # pragma: no cover - runtime environment variability
         app.logger.error("Could not load model %s: %s", model_path, exc)
         return None
 
 
-xray_model = _safe_load_model(MODEL_DIR / "medxai_model.h5")
+xray_model = _safe_load_model(MODEL_DIR / "medxai_model.keras")
 eye_model = _safe_load_model(MODEL_DIR / "eye_model.h5")
 
 
-def preprocess_image(image_bytes: bytes, target_size: tuple[int, int] = (224, 224)) -> tuple[np.ndarray, np.ndarray]:
+def preprocess_image(
+    image_bytes: bytes,
+    target_size: tuple[int, int] = (224, 224),
+    normalize: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image = image.resize(target_size)
     image_array = np.array(image)
-    normalized = image_array.astype(np.float32) / 255.0
-    batched = np.expand_dims(normalized, axis=0)
+    model_input = image_array.astype(np.float32)
+    if normalize:
+        model_input /= 255.0
+    batched = np.expand_dims(model_input, axis=0)
     return image_array, batched
 
 
@@ -133,8 +140,16 @@ def infer_prediction(model: tf.keras.Model | None, batch: np.ndarray, classes: l
         probs[np.random.randint(0, len(classes))] = random_conf
         probs = probs / probs.sum()
     else:
-        predictions = model.predict(batch, verbose=0)[0]
-        probs = predictions.astype(np.float32)
+        predictions = np.asarray(model.predict(batch, verbose=0)[0], dtype=np.float32).reshape(-1)
+        if predictions.size == 1 and len(classes) == 2:
+            positive_probability = float(np.clip(predictions[0], 0.0, 1.0))
+            probs = np.array([1.0 - positive_probability, positive_probability], dtype=np.float32)
+        elif predictions.size == len(classes):
+            probs = predictions
+        else:
+            raise ValueError(
+                f"Model returned {predictions.size} output(s), but {len(classes)} class labels were configured."
+            )
     idx = int(np.argmax(probs))
     return classes[idx], float(probs[idx]), probs
 
@@ -151,30 +166,37 @@ def generate_gradcam(
     image_batch: np.ndarray,
     original_image: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if model is None:
-        # Fallback pseudo heatmap for environments where weights are not present.
+    heatmap: np.ndarray | None = None
+    if model is not None:
+        try:
+            conv_layer_name = get_last_conv_layer(model)
+            grad_model = tf.keras.models.Model(
+                model.inputs,
+                [model.get_layer(conv_layer_name).output, model.output],
+            )
+
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = grad_model(image_batch)
+                pred_index = tf.argmax(predictions[0])
+                class_channel = predictions[:, pred_index]
+
+            grads = tape.gradient(class_channel, conv_outputs)
+            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+            conv_outputs = conv_outputs[0]
+            heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+            heatmap = tf.squeeze(heatmap)
+            heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+            heatmap = np.uint8(255 * heatmap.numpy())
+        except ValueError:
+            # medxai_model.keras stores its Conv2D layers inside a nested MobileNet model.
+            # Its convolution output is not directly addressable from the top-level graph.
+            app.logger.warning("Grad-CAM is unavailable for the loaded model; using a fallback heatmap.")
+
+    if heatmap is None:
+        # Fallback pseudo heatmap when weights or an addressable Conv2D layer are unavailable.
         gray = cv2.cvtColor(original_image, cv2.COLOR_RGB2GRAY)
         heatmap = cv2.GaussianBlur(gray, (11, 11), 0)
         heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    else:
-        conv_layer_name = get_last_conv_layer(model)
-        grad_model = tf.keras.models.Model(
-            model.inputs,
-            [model.get_layer(conv_layer_name).output, model.output],
-        )
-
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(image_batch)
-            pred_index = tf.argmax(predictions[0])
-            class_channel = predictions[:, pred_index]
-
-        grads = tape.gradient(class_channel, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-        heatmap = np.uint8(255 * heatmap.numpy())
 
     resized_heatmap = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
     color_map = cv2.applyColorMap(resized_heatmap, cv2.COLORMAP_JET)
@@ -315,7 +337,8 @@ def predict_xray() -> Any:
     uploaded = request.files["image"]
     safe_name = secure_filename(uploaded.filename or "xray.png")
     img_bytes = uploaded.read()
-    raw_image, batch = preprocess_image(img_bytes)
+    # medxai_model.keras contains MobileNet preprocessing and expects 0-255 RGB pixels.
+    raw_image, batch = preprocess_image(img_bytes, normalize=False)
 
     disease, confidence, _ = infer_prediction(xray_model, batch, XRAY_CLASSES)
     _, overlay = generate_gradcam(xray_model, batch, raw_image)
